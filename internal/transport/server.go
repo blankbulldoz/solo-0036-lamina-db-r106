@@ -90,6 +90,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("POST "+p+"/transactions/{tx}/delete", s.deleteRow)
 	s.mux.HandleFunc("POST "+p+"/transactions/{tx}/commit", s.commit)
 	s.mux.HandleFunc("POST "+p+"/transactions/{tx}/rollback", s.rollback)
+	s.mux.HandleFunc("GET "+p+"/transactions/{tx}/outcome", s.outcome)
 	s.mux.HandleFunc("POST "+p+"/get", s.get)
 	s.mux.HandleFunc("POST "+p+"/query", s.query)
 	s.mux.HandleFunc("POST "+p+"/sql", s.sql)

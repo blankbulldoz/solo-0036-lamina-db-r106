@@ -6,7 +6,6 @@ import (
 	"lamina/internal/datum"
 	"lamina/internal/journal"
 	"lamina/internal/versions"
-	"sort"
 	"time"
 )
 
@@ -15,15 +14,27 @@ type staged struct {
 	InsertOnly bool
 }
 type Transaction struct {
-	ID       string `json:"id"`
-	Snapshot uint64 `json:"snapshot"`
-	ReadOnly bool   `json:"read_only"`
-	Started  string `json:"started"`
-	writes   map[string]map[string]staged
+	ID         string `json:"id"`
+	Snapshot   uint64 `json:"snapshot"`
+	ReadOnly   bool   `json:"read_only"`
+	Started    string `json:"started"`
+	committing bool
+	writes     map[string]map[string]staged
 }
 type Commit struct {
 	Sequence uint64 `json:"sequence"`
 	Writes   int    `json:"writes"`
+}
+
+// TxnOutcome is the confirmation-ledger view of one transaction id. State is
+// "committed", "active" (still open in this instance) or "unknown" (no durable
+// commit and not active, e.g. rolled back or never confirmed). Reads after
+// restart therefore answer from durable facts, never from hope.
+type TxnOutcome struct {
+	Transaction string `json:"transaction"`
+	State       string `json:"state"`
+	Sequence    uint64 `json:"sequence,omitempty"`
+	Writes      int    `json:"writes,omitempty"`
 }
 
 func (d *DB) Begin(readOnly bool) (Transaction, error) {
@@ -64,6 +75,9 @@ func (d *DB) Put(id, table string, row datum.Row, insertOnly bool) error {
 	}
 	if tx.ReadOnly {
 		return fault("conflict", "read-only transaction")
+	}
+	if tx.committing {
+		return fault("conflict", "transaction commit in progress")
 	}
 	r, err := d.catalog.Relation(table)
 	if err != nil {
@@ -119,6 +133,9 @@ func (d *DB) Delete(id, table string, value datum.Value) error {
 	if tx.ReadOnly {
 		return fault("conflict", "read-only transaction")
 	}
+	if tx.committing {
+		return fault("conflict", "transaction commit in progress")
+	}
 	r, err := d.catalog.Relation(table)
 	if err != nil {
 		return invalid(err)
@@ -146,49 +163,141 @@ func (d *DB) Rollback(id string) error {
 	if err := d.usable(); err != nil {
 		return err
 	}
-	if _, err := d.tx(id); err != nil {
+	tx, err := d.tx(id)
+	if err != nil {
 		return err
+	}
+	if tx.committing {
+		return fault("conflict", "transaction commit in progress")
 	}
 	delete(d.transactions, id)
 	return nil
 }
+
+// Commit keeps the original single-transaction entry point. Internally the
+// request joins the bounded group-commit pipeline so frames arriving together
+// share one fsync, but this transaction receives its own result and is never
+// bound to the fate of the rest of the group.
 func (d *DB) Commit(id string) (Commit, error) {
 	d.mu.Lock()
-	defer d.mu.Unlock()
 	if err := d.usable(); err != nil {
+		d.mu.Unlock()
 		return Commit{}, err
 	}
 	tx, err := d.tx(id)
 	if err != nil {
+		d.mu.Unlock()
 		return Commit{}, err
 	}
-	defer delete(d.transactions, id)
-	writes := make([]versions.Mutation, 0)
-	for table, mutations := range tx.writes {
-		for key, m := range mutations {
-			if d.store.Latest(table, key) > tx.Snapshot {
-				d.conflicts++
-				return Commit{}, fault("conflict", "write conflict on %s", table)
+	if tx.committing {
+		d.mu.Unlock()
+		return Commit{}, fault("conflict", "transaction commit already in progress")
+	}
+	if len(flattenWrites(tx.writes)) == 0 {
+		// Read-only/empty commit publishes nothing and consumes no sequence.
+		delete(d.transactions, id)
+		seq := tx.Snapshot
+		d.mu.Unlock()
+		return Commit{Sequence: seq}, nil
+	}
+	tx.committing = true
+	job := d.buildCommitJob(tx)
+	d.mu.Unlock()
+
+	if err = d.committer.submit(job); err != nil {
+		d.mu.Lock()
+		if current, ok := d.transactions[id]; ok && current == tx {
+			tx.committing = false
+		}
+		d.mu.Unlock()
+		return Commit{}, err
+	}
+	return d.committer.wait(job)
+}
+
+// flattenWrites collects a transaction's private write set in deterministic
+// order for validation and journal encoding.
+func flattenWrites(byTable map[string]map[string]staged) []versions.Mutation {
+	out := make([]versions.Mutation, 0)
+	for _, mutations := range byTable {
+		for _, m := range mutations {
+			out = append(out, m.Mutation)
+		}
+	}
+	return sortedMutations(out)
+}
+
+// buildCommitJob creates the pipeline job for one transaction. Validation runs
+// later, under the lock, against published state plus the cumulative overlay of
+// writes already accepted earlier in the same group.
+func (d *DB) buildCommitJob(tx *Transaction) *commitJob {
+	id := tx.ID
+	job := &commitJob{kind: jobTransaction, txID: id}
+	job.prepare = func(seq uint64, accepted map[string]map[string]staged) (journal.Record, error) {
+		_ = seq
+		writes := flattenWrites(tx.writes)
+		// Same-key first-committer-wins against both durable commits and the
+		// transactions accepted ahead of this one in the same group.
+		for _, m := range writes {
+			if d.store.Latest(m.Relation, m.Key) > tx.Snapshot {
+				d.conflicts.Add(1)
+				delete(d.transactions, id)
+				return journal.Record{}, fault("conflict", "write conflict on %s", m.Relation)
 			}
-			writes = append(writes, m.Mutation)
+			if _, ok := accepted[m.Relation][m.Key]; ok {
+				d.conflicts.Add(1)
+				delete(d.transactions, id)
+				return journal.Record{}, fault("conflict", "write conflict on %s", m.Relation)
+			}
 		}
-		if err = d.unique(table, tx.writes); err != nil {
-			d.conflicts++
-			return Commit{}, err
+		// Unique constraints are checked against the final state this commit
+		// would produce, including earlier accepted writes of the same group.
+		tables := map[string]bool{}
+		for _, m := range writes {
+			tables[m.Relation] = true
 		}
-	}
-	if len(writes) == 0 {
-		return Commit{Sequence: tx.Snapshot}, nil
-	}
-	sort.Slice(writes, func(i, j int) bool {
-		if writes[i].Relation == writes[j].Relation {
-			return writes[i].Key < writes[j].Key
+		for table := range tables {
+			if err := d.uniqueWithOverlay(table, tx.writes, accepted); err != nil {
+				d.conflicts.Add(1)
+				delete(d.transactions, id)
+				return journal.Record{}, err
+			}
 		}
-		return writes[i].Relation < writes[j].Relation
-	})
-	if err = d.publish(journal.Record{Kind: "commit", Transaction: id, Writes: writes}); err != nil {
-		return Commit{}, err
+		// Accept: register into the group overlay so later group members contend
+		// against the truly accepted state.
+		for table, mutations := range tx.writes {
+			if accepted[table] == nil {
+				accepted[table] = map[string]staged{}
+			}
+			for key, m := range mutations {
+				accepted[table][key] = m
+			}
+		}
+		return journal.Record{Kind: "commit", Transaction: id, Writes: writes}, nil
 	}
-	d.commits++
-	return Commit{Sequence: d.sequence, Writes: len(writes)}, nil
+	job.applied = func(record journal.Record) {
+		delete(d.transactions, id)
+		d.commits.Add(1)
+		job.result = Commit{Sequence: record.Sequence, Writes: len(record.Writes)}
+	}
+	return job
+}
+
+// TransactionOutcome reconciles one id against the durable journal and the live
+// transaction table. It never reports success for work that has no durable
+// record; callers holding an uncertain response use this after restart.
+func (d *DB) TransactionOutcome(id string) (TxnOutcome, error) {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	if err := d.usable(); err != nil {
+		return TxnOutcome{}, err
+	}
+	if commit, ok := reconcileOutcome(d.wal.Records, id); ok {
+		return TxnOutcome{Transaction: id, State: "committed", Sequence: commit.Sequence, Writes: commit.Writes}, nil
+	}
+	if tx, ok := d.transactions[id]; ok {
+		_ = tx
+		return TxnOutcome{Transaction: id, State: "active"}, nil
+	}
+	return TxnOutcome{Transaction: id, State: "unknown"}, nil
 }

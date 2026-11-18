@@ -145,34 +145,66 @@ func (w *WAL) recover() error {
 	_, err := w.file.Seek(0, io.SeekEnd)
 	return err
 }
+
+var ErrFrameTooLarge = fmt.Errorf("commit exceeds journal frame limit")
+
+// Append durably writes one record with its own fsync. It remains for callers
+// that need a single-record write; the engine normally uses AppendBatch so that
+// records arriving together share one write and one fsync.
 func (w *WAL) Append(r Record) error {
+	return w.AppendBatch([]Record{r})
+}
+
+// AppendBatch encodes and durably writes several contiguous records with a
+// single write and a single fsync. The frame sequence numbers must be
+// contiguous and continue the journal. On a write or sync failure the WAL is
+// poisoned: the outcome is uncertain and the owning instance must stop serving
+// and recover from the journal before accepting more work. Pre-write failures
+// (encoding or frame budget) leave the WAL untouched and are reported without
+// poisoning because nothing reached the file.
+func (w *WAL) AppendBatch(records []Record) error {
 	if w.Poisoned {
 		return fmt.Errorf("journal is unavailable; restart required")
 	}
-	if r.Sequence != w.Base+uint64(len(w.Records))+1 {
-		return fmt.Errorf("noncontiguous journal sequence")
+	if len(records) == 0 {
+		return nil
 	}
-	r.Format = 1
-	payload, err := json.Marshal(r)
-	if err != nil {
-		return err
+	expected := w.Base + uint64(len(w.Records)) + 1
+	frames := make([][]byte, 0, len(records))
+	total := 0
+	for _, r := range records {
+		if r.Sequence != expected {
+			return fmt.Errorf("noncontiguous journal sequence")
+		}
+		expected++
+		r.Format = 1
+		payload, err := json.Marshal(r)
+		if err != nil {
+			return err
+		}
+		if len(payload) > MaxFrame {
+			return ErrFrameTooLarge
+		}
+		frame := make([]byte, 8+len(payload))
+		binary.BigEndian.PutUint32(frame[:4], uint32(len(payload)))
+		binary.BigEndian.PutUint32(frame[4:8], crc32.ChecksumIEEE(payload))
+		copy(frame[8:], payload)
+		frames = append(frames, frame)
+		total += len(frame)
 	}
-	if len(payload) > MaxFrame {
-		return fmt.Errorf("commit exceeds journal frame limit")
+	combined := make([]byte, 0, total)
+	for _, frame := range frames {
+		combined = append(combined, frame...)
 	}
-	frame := make([]byte, 8+len(payload))
-	binary.BigEndian.PutUint32(frame[:4], uint32(len(payload)))
-	binary.BigEndian.PutUint32(frame[4:8], crc32.ChecksumIEEE(payload))
-	copy(frame[8:], payload)
-	if _, err = w.file.Write(frame); err != nil {
+	if _, err := w.file.Write(combined); err != nil {
 		w.Poisoned = true
 		return err
 	}
-	if err = w.file.Sync(); err != nil {
+	if err := w.file.Sync(); err != nil {
 		w.Poisoned = true
 		return err
 	}
-	w.Records = append(w.Records, r)
+	w.Records = append(w.Records, records...)
 	return nil
 }
 func (w *WAL) Close() error {

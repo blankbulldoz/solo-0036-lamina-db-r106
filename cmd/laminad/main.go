@@ -25,7 +25,16 @@ func run() error {
 	dir := flag.String("data", "var/lamina", "data directory exclusively owned by this process")
 	addr := flag.String("listen", "127.0.0.1:7386", "HTTP bind address")
 	restore := flag.String("restore", "", "validated backup to install into a new data directory before serving")
+	commitDwell := flag.Duration("commit-dwell", 2*time.Millisecond, "max wait for commits to share one fsync (bounded group-commit latency)")
+	commitGroup := flag.Int("commit-group", 64, "max records sharing one fsync group")
+	commitQueue := flag.Int("commit-queue", 256, "max queued commits held in memory; full queue rejects with 429")
 	flag.Parse()
+	if *commitDwell <= 0 || *commitGroup <= 0 || *commitQueue <= 0 {
+		return fmt.Errorf("commit-dwell, commit-group and commit-queue must be positive")
+	}
+	if *commitGroup > 1024 || *commitQueue > 4096 {
+		return fmt.Errorf("commit-group <= 1024 and commit-queue <= 4096")
+	}
 	if *restore != "" {
 		info, err := os.Stat(*restore)
 		if err != nil {
@@ -42,7 +51,7 @@ func run() error {
 			return err
 		}
 	}
-	db, err := engine.Open(*dir)
+	db, err := engine.OpenWith(*dir, engine.CommitOptions{MaxDwell: *commitDwell, MaxGroup: *commitGroup, QueueDepth: *commitQueue})
 	if err != nil {
 		return err
 	}

@@ -368,6 +368,66 @@
       "success": "query execution facts and database resource state produces a verified domain result",
       "failure": "candidates vs scanned vs returned have distinct meanings",
       "verification": "python3 examples/walkthrough.py --workflow statistics"
+    },
+    {
+      "id": "group-commit",
+      "name": "bounded shared-fsync group commit with per-transaction outcomes",
+      "entry": "POST /transactions/{tx}/commit concurrent burst",
+      "steps": [
+        "transport",
+        "engine",
+        "journal",
+        "versions",
+        "catalog"
+      ],
+      "module_ids": [
+        "transport",
+        "engine",
+        "journal",
+        "versions",
+        "catalog"
+      ],
+      "success": "arriving commits share one write/fsync while each transaction gets its own result and short reads keep progressing",
+      "failure": "same-key and unique contention decided against earlier accepted transactions; full queue rejects 429; group is not all-or-nothing",
+      "verification": "python3 examples/walkthrough.py --workflow group-commit"
+    },
+    {
+      "id": "restart-reconcile",
+      "name": "confirmation ledger reconciliation across restart",
+      "entry": "GET /transactions/{tx}/outcome after restart",
+      "steps": [
+        "transport",
+        "engine",
+        "journal",
+        "versions"
+      ],
+      "module_ids": [
+        "transport",
+        "engine",
+        "journal",
+        "versions"
+      ],
+      "success": "acknowledged transactions are fully present after restart and reconcile per id",
+      "failure": "unconfirmed ids report unknown rather than invented success; readable range follows watermark",
+      "verification": "python3 examples/walkthrough.py --workflow restart-reconcile"
+    },
+    {
+      "id": "commit-failure",
+      "name": "uncertain sync fails closed with bounded queue",
+      "entry": "commit under induced journal write failure",
+      "steps": [
+        "transport",
+        "engine",
+        "journal"
+      ],
+      "module_ids": [
+        "transport",
+        "engine",
+        "journal"
+      ],
+      "success": "sync failure returns 503 and stops service; restart reconciles each independent transaction",
+      "failure": "no optimistic success, no unbounded queue; oversized frame is a 429 that does not poison the journal",
+      "verification": "python3 examples/walkthrough.py --workflow commit-failure"
     }
   ],
   "complexity": {

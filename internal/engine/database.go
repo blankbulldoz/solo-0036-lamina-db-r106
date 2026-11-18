@@ -10,6 +10,8 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
+	"time"
 )
 
 type DB struct {
@@ -23,12 +25,17 @@ type DB struct {
 	horizon      uint64
 	transactions map[string]*Transaction
 	closed       bool
-	commits      uint64
-	conflicts    uint64
-	queries      uint64
+	committer    *committer
+	commits      atomic.Uint64
+	conflicts    atomic.Uint64
+	queries      atomic.Uint64
 }
 
 func Open(dir string) (*DB, error) {
+	return OpenWith(dir, DefaultCommitOptions())
+}
+
+func OpenWith(dir string, opts CommitOptions) (*DB, error) {
 	absolute, err := filepath.Abs(dir)
 	if err != nil {
 		return nil, err
@@ -75,6 +82,7 @@ func Open(dir string) (*DB, error) {
 			return nil, fmt.Errorf("recovered constraints: %w", err)
 		}
 	}
+	d.committer = newCommitter(d, opts)
 	return d, nil
 }
 func (d *DB) usable() error {
@@ -88,29 +96,24 @@ func (d *DB) usable() error {
 }
 func (d *DB) Close() error {
 	d.mu.Lock()
-	defer d.mu.Unlock()
 	if d.closed {
+		d.mu.Unlock()
 		return nil
 	}
 	d.closed = true
+	committer := d.committer
 	d.transactions = map[string]*Transaction{}
+	d.mu.Unlock()
+
+	// Stop accepting durable work and give queued commits a bounded window to
+	// finish; anything beyond that is reported uncertain rather than lost
+	// silently. Then close the journal.
+	if committer != nil {
+		committer.shutdown(10 * time.Second)
+	}
 	return d.wal.Close()
 }
-func (d *DB) publish(r journal.Record) error {
-	r.Sequence = d.sequence + 1
-	r.Format = 1
-	if err := d.wal.Append(r); err != nil {
-		return fault("unavailable", "durable commit failed: %s", err)
-	}
-	if err := d.apply(r); err != nil {
-		d.wal.Poisoned = true
-		return fault("unavailable", "durable record cannot be applied: %s", err)
-	}
-	if len(r.Writes) > 0 {
-		d.indexes.Apply(d.catalog, r.Writes)
-	}
-	return nil
-}
+
 func (d *DB) Relations() ([]catalog.Relation, []catalog.Index, error) {
 	d.mu.RLock()
 	defer d.mu.RUnlock()

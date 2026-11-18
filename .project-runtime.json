@@ -62,6 +62,18 @@
     {
       "workflow_id": "statistics",
       "command": "python3 examples/walkthrough.py --workflow statistics"
+    },
+    {
+      "workflow_id": "group-commit",
+      "command": "python3 examples/walkthrough.py --workflow group-commit"
+    },
+    {
+      "workflow_id": "restart-reconcile",
+      "command": "python3 examples/walkthrough.py --workflow restart-reconcile"
+    },
+    {
+      "workflow_id": "commit-failure",
+      "command": "python3 examples/walkthrough.py --workflow commit-failure"
     }
   ]
 }

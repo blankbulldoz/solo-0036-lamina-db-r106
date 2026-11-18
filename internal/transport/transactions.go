@@ -63,6 +63,19 @@ func (s *Server) rollback(w http.ResponseWriter, r *http.Request) {
 	}
 	write(w, 200, map[string]string{"state": "rolled_back"})
 }
+
+// outcome reconciles a transaction id against the durable confirmation ledger.
+// Clients use it after an uncertain write result or a restart: a "committed"
+// answer means the transaction is fully durable and visible, "unknown" means no
+// durable commit exists (the group as a whole is never all-or-nothing).
+func (s *Server) outcome(w http.ResponseWriter, r *http.Request) {
+	out, err := s.db.TransactionOutcome(r.PathValue("tx"))
+	if err != nil {
+		respondError(w, err)
+		return
+	}
+	write(w, 200, out)
+}
 func (s *Server) get(w http.ResponseWriter, r *http.Request) {
 	var in struct {
 		Relation    string      `json:"relation"`

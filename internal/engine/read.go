@@ -6,8 +6,11 @@ import (
 )
 
 func (d *DB) Query(q query.Request) (query.Result, error) {
-	d.mu.Lock()
-	defer d.mu.Unlock()
+	// A read lock is sufficient and deliberately does not block on a group
+	// commit's disk sync: ordinary short reads keep progressing against the
+	// last published sequence while frames are being flushed.
+	d.mu.RLock()
+	defer d.mu.RUnlock()
 	if err := d.usable(); err != nil {
 		return query.Result{}, err
 	}
@@ -56,7 +59,7 @@ func (d *DB) Query(q query.Request) (query.Result, error) {
 		overlay(rows, tx.writes, q.Relation)
 	}
 	result, err := query.Execute(r, q, rows, plan, keys)
-	d.queries++
+	d.queries.Add(1)
 	if err != nil {
 		return result, invalid(err)
 	}

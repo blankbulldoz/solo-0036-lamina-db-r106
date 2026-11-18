@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
 """Bounded production walkthroughs using only the public HTTP service."""
-import argparse, concurrent.futures, json, os, pathlib, shutil, socket, subprocess, tempfile, time, urllib.request, urllib.error
-WORKFLOWS=['catalog-create','txn-write','snapshot-read','index-build','query-plan','sql-execute','txn-conflict','restart','checkpoint','backup-restore','changes','vacuum','transaction-close','statistics']
+import argparse, concurrent.futures, json, os, pathlib, shutil, socket, subprocess, tempfile, threading, time, urllib.request, urllib.error
+WORKFLOWS=['catalog-create','txn-write','snapshot-read','index-build','query-plan','sql-execute','txn-conflict','restart','checkpoint','backup-restore','changes','vacuum','transaction-close','statistics','group-commit','restart-reconcile','commit-failure']
 class Session:
- def __init__(self,binary,root,restore=None):
-  self.binary=str(binary);self.root=pathlib.Path(root);self.restore=restore;self.process=None;self.log=None
+ def __init__(self,binary,root,restore=None,extra_args=None):
+  self.binary=str(binary);self.root=pathlib.Path(root);self.restore=restore;self.process=None;self.log=None;self.extra_args=extra_args or []
  def start(self):
   with socket.socket() as sock:
    sock.bind(('127.0.0.1',0));port=sock.getsockname()[1]
   self.url=f'http://127.0.0.1:{port}/v1/lamina'
-  args=[self.binary,'-data',str(self.root),'-listen',f'127.0.0.1:{port}']
+  args=[self.binary,'-data',str(self.root),'-listen',f'127.0.0.1:{port}']+list(self.extra_args)
   if self.restore:args+=['-restore',str(self.restore)];self.restore=None
   self.log=tempfile.TemporaryFile();self.process=subprocess.Popen(args,stdout=self.log,stderr=self.log)
   deadline=time.monotonic()+8
@@ -36,6 +36,7 @@ class Session:
  def begin(self,readonly=False):return self.call('POST','/transactions',{'read_only':readonly},201)['id']
  def put(self,tx,row,status=200,insert=False):return self.call('POST',f'/transactions/{tx}/put',{'relation':'spectra','row':row,'insert_only':insert},status)
  def commit(self,tx,status=200):return self.call('POST',f'/transactions/{tx}/commit',status=status)
+ def outcome(self,tx):return self.call('GET',f'/transactions/{tx}/outcome')
  def query(self,**kwargs):return self.call('POST','/query',{'relation':'spectra',**kwargs})
  def stats(self):return self.call('GET','/stats')
 def require(condition,message):
@@ -152,11 +153,166 @@ def walkthrough(name,binary):
     q=s.query(where=[{'column':'amplitude','op':'>=','value':40}],limit=2)
     require(q['matched']==3 and q['scanned']==3 and len(q['rows'])==2 and q['truncated'],'query fact meanings conflated')
     observations={'query':q,'stats':s.stats()}
+   elif name=='group-commit':
+    observations=group_commit(s)
+   elif name=='restart-reconcile':
+    observations=restart_reconcile(s)
+   elif name=='commit-failure':
+    observations=commit_failure(binary,temp)
    else:raise ValueError(name)
    return {'workflow':name,'status':'observed','observations':observations}
   finally:
    s.stop()
    if other:other.stop()
+def group_commit(s):
+ """Concurrent small transactions share fsync groups but keep per-txn outcomes.
+ Success and conflict mix inside one group; maintenance interleaves; short reads
+ keep progressing; the group is never all-or-nothing."""
+ s.call('POST','/indexes',{'name':'uniq_band','relation':'spectra','column':'band','unique':True},201)
+ def one_commit(n,band=None):
+  tx=s.begin();s.put(tx,tuple_(n,band=band))
+  try:s.commit(tx);return 'ok'
+  except RuntimeError as e:
+   require('got 409' in str(e),'unexpected commit status: '+str(e));return 'conflict'
+ # Build a burst: several rows fight over one unique band. Which submit loses can
+ # differ because the bounded dwell may split arrivals across flush groups; the
+ # contract is that exactly one holder of the unique value survives, not which.
+ jobs=[]
+ with concurrent.futures.ThreadPoolExecutor(12) as pool:
+  for n in range(100,140):
+   band='shared' if n%5==0 else f'band-{n}'
+   jobs.append(pool.submit(one_commit,n,band))
+  verdicts=[j.result() for j in jobs]
+ conflicts=sum(1 for v in verdicts if v=='conflict')
+ successes=len(verdicts)-conflicts
+ require(conflicts>=1 and successes>=1,'group must mix success and conflict')
+ # No group atomicity: every accepted txn is independently queryable; losers
+ # published nothing. The contended unique band resolves to exactly one row.
+ rows=s.query(limit=10000)['rows']
+ shared=[r for r in rows if r['band']=='shared']
+ require(len(shared)==1,'unique contention resolved incorrectly')
+ # Bounded queue stats report the actual sharing and occupancy bounds.
+ st=s.stats()['commit_queue']
+ require(st['queued']==0 and st['peak_queued']<=st['queue_depth'],'queue bound not observed')
+ require(st['flush_groups']>=1,'no flush group recorded')
+ # Maintenance interleaved with more commits must never see tentative state.
+ cp=s.call('POST','/checkpoint')['sequence']
+ tx=s.begin();s.put(tx,tuple_(200));s.commit(tx)
+ vac=s.call('POST','/vacuum',{'horizon':s.stats()['sequence']})
+ require(vac['horizon']<=s.stats()['sequence'],'vacuum crossed durable head')
+ # Short reads keep advancing while a commit storm is in flight.
+ progress=[]
+ def storm():
+  with concurrent.futures.ThreadPoolExecutor(8) as pool:
+   list(pool.map(lambda n:one_commit(300+n,f's-{n}'),range(24)))
+ reader=threading.Thread(target=storm)
+ reader.start()
+ for _ in range(8):
+  progress.append(s.query()['matched']);time.sleep(.005)
+ reader.join()
+ require(progress==sorted(progress) and len(set(progress))>=1,'short reads stalled during sync')
+ return {'succeeded':successes,'conflicted':conflicts,'groups':st['flush_groups'],
+         'batched':st['batched_records'],'peak_queued':st['peak_queued'],
+         'checkpoint':cp,'read_matched':progress[-1]}
+def restart_reconcile(s):
+ """Commits acknowledged before stop are fully present after restart; the
+ confirmation ledger answers per-transaction without group atomicity."""
+ ids=[];seqs=[]
+ for n in range(400,408):
+  tx=s.begin();s.put(tx,tuple_(n));res=s.commit(tx);ids.append(tx);seqs.append(res['sequence'])
+ head=s.stats()['sequence']
+ s.stop();s.start()
+ require(s.stats()['sequence']==head,'durable head changed across restart')
+ for tx,seq in zip(ids,seqs):
+  oc=s.outcome(tx)
+  require(oc['state']=='committed' and oc['sequence']==seq,'acknowledged txn missing after restart')
+ # A never-committed / rolled-back id is honestly unknown, not invented.
+ ghost=s.begin();s.call('POST',f'/transactions/{ghost}/rollback')
+ require(s.outcome(ghost)['state']=='unknown','unknown txn reported as committed')
+ # Readable range after restart matches the retained watermark and head.
+ st=s.stats()
+ rng=s.call('POST','/query',{'relation':'spectra','at':st['sequence']})
+ require(st['horizon']<=st['sequence'] and rng['matched']>=8,'post-restart readable range wrong')
+ s.call('POST','/query',{'relation':'spectra','at':st['sequence']+1},410)
+ return {'head':head,'reconciled':len(ids),'horizon':st['horizon']}
+def commit_failure(binary,temp):
+ """A failed/uncertain sync fails closed (503) and never fakes success. After
+ restart the ledger tells each client whether its independent transaction made
+ it; the queue also has a hard bound (429) instead of unbounded waiting."""
+ import resource
+ # Bounded rejection path: tiny in-memory queue refuses overflow with 429.
+ bounded=Session(binary,temp/'bounded',extra_args=['--commit-queue','1','--commit-dwell','20ms']).start()
+ seed(bounded)
+ rejected=0;ok=0
+ def burst(n):
+  tx=bounded.begin();bounded.put(tx,tuple_(500+n))
+  try:bounded.commit(tx);return 'ok'
+  except RuntimeError as e:return '429' if 'got 429' in str(e) else 'other'
+ with concurrent.futures.ThreadPoolExecutor(16) as pool:
+  for verdict in pool.map(burst,range(48)):
+   if verdict=='429':rejected+=1
+   elif verdict=='ok':ok+=1
+ require(rejected>=1,'full queue was not rejected')
+ bounded.stop()
+ # Durability failure path: cap file size so the journal write/fsync errors.
+ capped=Session(binary,temp/'capped').start()
+ seed(capped)
+ current=(capped.root/'journal.lmw').stat().st_size
+ capped.stop()
+ # One append may fit up to the cap; the next append crosses it and the kernel
+ # returns EFBIG, which the engine must treat as an uncertain durable failure.
+ limit=current+256
+ def preexec():
+  resource.setrlimit(resource.RLIMIT_FSIZE,(limit,limit))
+ port_arg=None
+ import socket
+ with socket.socket() as sk:
+  sk.bind(('127.0.0.1',0));port_arg=sk.getsockname()[1]
+ args=[str(binary),'-data',str(capped.root),'-listen',f'127.0.0.1:{port_arg}']
+ log=tempfile.TemporaryFile()
+ proc=subprocess.Popen(args,stdout=log,stderr=log,preexec_fn=preexec)
+ url=f'http://127.0.0.1:{port_arg}/v1/lamina'
+ deadline=time.monotonic()+8
+ while time.monotonic()<deadline:
+  try:
+   urllib.request.urlopen(urllib.request.Request(url+'/health'),timeout=2);break
+  except (OSError,urllib.error.URLError):time.sleep(.05)
+ def capped_call(method,path,data=None):
+  enc=None if data is None else json.dumps(data).encode()
+  req=urllib.request.Request(url+path,data=enc,method=method,headers={'Content-Type':'application/json'})
+  try:
+   with urllib.request.urlopen(req,timeout=8) as r:return r.status,json.loads(r.read())
+  except urllib.error.HTTPError as e:return e.code,json.loads(e.read())
+ ids=[];uncertain=[]
+ for n in range(600,612):
+  code,body=capped_call('POST','/transactions',{})
+  if code!=201:
+   uncertain.append(('begin',code));continue
+  tx=body['id']
+  code,_=capped_call('POST',f'/transactions/{tx}/put',{'relation':'spectra','row':tuple_(n)})
+  code,body=capped_call('POST',f'/transactions/{tx}/commit')
+  ids.append((tx,code))
+  if code==503:uncertain.append((tx,503))
+ # Once poisoned the instance must refuse further service rather than recover.
+ hcode,_=capped_call('GET','/health')
+ require(hcode==503,'poisoned instance kept serving')
+ require(len(uncertain)>=1,'no uncertain commit observed')
+ proc.terminate()
+ try:proc.wait(timeout=10)
+ except subprocess.TimeoutExpired:proc.kill();proc.wait()
+ log.close()
+ # Restart on the same directory and reconcile each independent transaction.
+ recovered=Session(binary,temp/'capped').start()
+ durable=0;missing=0
+ for tx,code in ids:
+  oc=recovered.outcome(tx)
+  if oc['state']=='committed':durable+=1
+  elif oc['state']=='unknown':missing+=1
+ # Some of the independent transactions may have landed; no all-or-nothing claim.
+ require(durable+missing==len(ids),'ledger could not classify every txn')
+ recovered.stop()
+ return {'queue_rejected':rejected,'queue_accepted':ok,'uncertain_commits':len(uncertain),
+         'reconciled_durable':durable,'reconciled_unknown':missing,'poisoned_health':hcode}
 def main():
  parser=argparse.ArgumentParser();parser.add_argument('--workflow',choices=['all',*WORKFLOWS],default='all');args=parser.parse_args()
  project=pathlib.Path(__file__).resolve().parents[1];binary=project/'bin/laminad'
